@@ -862,6 +862,25 @@ class Int8DynamicActivationInt8WeightConfig(AOBaseConfig):
         )
 
 
+def _register_int8_cpu_lowering_passes(device: torch.device) -> None:
+    """Let inductor lower int8 activation linears to onednn::qlinear on CPU.
+
+    The fusion patterns used to live in inductor, which registered them for
+    every compile, until pytorch#178466 moved them here. In torchao they are
+    only registered as a side effect of importing the pt2e x86 quantizer, which
+    the quantize_ flow never does, so ask for them explicitly. Registration is
+    cached, so calling this per module is cheap.
+    """
+    if device.type != "cpu":
+        return
+
+    from torchao.quantization.pt2e.inductor_passes.x86 import (
+        _register_quantization_weight_pack_pass,
+    )
+
+    _register_quantization_weight_pack_pass()
+
+
 def _int8_dynamic_activation_int8_weight_quantize_tensor(weight, config):
     assert config.version == 2, f"Unexpected version: {config.version}"
     act_granularity, weight_granularity = Int8Tensor._normalize_granularity(
@@ -896,9 +915,9 @@ def _int8_dynamic_activation_int8_weight_transform(
         f"applying int8 dynamic activation int8 weight quant requires module to have {parameter_name} attribute"
         + f" but {module} does not have one"
     )
-    new_weight = _int8_dynamic_activation_int8_weight_quantize_tensor(
-        getattr(module, parameter_name), config
-    )
+    weight = getattr(module, parameter_name)
+    _register_int8_cpu_lowering_passes(weight.device)
+    new_weight = _int8_dynamic_activation_int8_weight_quantize_tensor(weight, config)
     setattr(
         module,
         parameter_name,
@@ -998,6 +1017,8 @@ def _int8_static_activation_int8_weight_transform(
     act_quant_zero_point = None
     if config.act_quant_zero_point is not None:
         act_quant_zero_point = config.act_quant_zero_point.detach()
+
+    _register_int8_cpu_lowering_passes(getattr(module, parameter_name).device)
 
     quantized_tensor = Int8Tensor.from_hp(
         getattr(module, parameter_name),

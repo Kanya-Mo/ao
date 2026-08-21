@@ -8,6 +8,8 @@
 # This test takes a long time to run
 import copy
 import gc
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -602,6 +604,33 @@ class TestQuantFlow(TestCase):
         model(*example_inputs)
         assert isinstance(model.linear1.weight, Float8Tensor)
         assert not isinstance(model.linear2.weight, Float8Tensor)
+
+    @unittest.skipIf(
+        not torch.backends.mkldnn.is_available(), "onednn qlinear needs mkldnn"
+    )
+    def test_int8_dynamic_activation_cpu_lowers_to_qlinear(self):
+        # Importing the pt2e x86 quantizer registers the fusion patterns as a side
+        # effect, so this has to run in a fresh process to see what a user of
+        # quantize_ alone gets from inductor.
+        script = """
+import torch
+from torch._dynamo.utils import counters
+from torch._inductor import config
+from torchao.quantization import Int8DynamicActivationInt8WeightConfig, quantize_
+
+config.freezing = True
+m = torch.nn.Linear(64, 128, bias=False).to(torch.bfloat16).eval()
+quantize_(m, Int8DynamicActivationInt8WeightConfig(set_inductor_config=False))
+with torch.no_grad():
+    torch.compile(m)(torch.randn(1, 1, 64, dtype=torch.bfloat16))
+print("QLINEAR_MATCHES", counters["inductor"]["qlinear_weight_prepack_matcher_count"])
+"""
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], text=True, stderr=subprocess.STDOUT
+        )
+        matches = [l for l in out.splitlines() if l.startswith("QLINEAR_MATCHES")]
+        self.assertEqual(len(matches), 1, out)
+        self.assertEqual(int(matches[0].split()[1]), 1, out)
 
 
 common_utils.instantiate_parametrized_tests(TestQuantFlow)

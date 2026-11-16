@@ -5,11 +5,11 @@
 /torchao/quantization/ @jerryzh168 @andrewor14 @vkuzo
 
 # Float8 / Low-precision training
-/torchao/float8/ @vkuzo @jerryzh168 @andrewor14
+/torchao/float8/ @vkuzo @jerryzh168 @andrewor14 @jeffdaily
 
 # Prototype: MX formats and MoE training
-/torchao/prototype/mx_formats/ @drisspg @jerryzh168 @vkuzo @andrewor14
-/torchao/prototype/moe_training/ @jerryzh168 @vkuzo @andrewor14
+/torchao/prototype/mx_formats/ @drisspg @jerryzh168 @vkuzo @andrewor14 @jeffdaily
+/torchao/prototype/moe_training/ @jerryzh168 @vkuzo @andrewor14 @jeffdaily
 
 # Sparsity
 /torchao/sparsity/ @jerryzh168 @vkuzo @andrewor14
@@ -23,6 +23,10 @@
 # Kernels
 /torchao/kernel/ @jerryzh168 @vkuzo @andrewor14
 /torchao/csrc/ @jerryzh168 @vkuzo @andrewor14
+
+# Low-bit CPU kernels
+/torchao/csrc/cpu/shared_kernels/ @digantdesai @metascroy @vkuzo @andrewor14
+/torchao/csrc/cpu/torch_free_kernels/ @digantdesai @metascroy @vkuzo @andrewor14
 
 # Docs
 /docs/ @vkuzo @jerryzh168 @andrewor14
@@ -39,7 +43,17 @@ torchao/quantization/pt2e/quantizer/x86_inductor_quantizer.py @Xia-Weiwen @jerry
 /docs/source/pt2e_quantization/pt2e_quant_xpu_inductor.rst  @liangan1 @vkuzo @jerryzh168 @andrewor14
 /torchao/quantization/pt2e/quantizer/xpu_inductor_quantizer.py @liangan1 @vkuzo @jerryzh168 @andrewor14
 /torchao/quantization/quantize_/workflows/int4/int4_plain_int32_tensor.py @liangan1 @vkuzo @jerryzh168 @andrewor14
+/test/quantization/quantize_/workflows/int4/test_int4_plain_int32_tensor.py @liangan1 @vkuzo @jerryzh168 @andrewor14
 .github/scripts/ci_test_xpu.sh @liangan1 @vkuzo @jerryzh168 @andrewor14
 .github/workflows/xpu_test.yml @liangan1 @vkuzo @jerryzh168 @andrewor14
 
-
+# ROCm
+/torchao/csrc/cuda/ @jeffdaily @jerryzh168 @vkuzo @andrewor14
+/test/float8/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/test/prototype/mx_formats/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/test/prototype/moe_training/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/benchmarks/float8/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/benchmarks/mx_formats/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/benchmarks/prototype/moe_training/ @jeffdaily @vkuzo @jerryzh168 @andrewor14
+/setup.py @jeffdaily @jerryzh168 @vkuzo @andrewor14
+/.github/**/*rocm* @jeffdaily @vkuzo @jerryzh168 @andrewor14

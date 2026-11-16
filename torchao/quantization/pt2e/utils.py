@@ -200,15 +200,12 @@ def calculate_qmin_qmax(
     """
     # TODO(jerryzh): Figure out why custom quant_min/quant_max are still adjusted.
     if has_customized_qrange:
-        # This initialization here is to be resolve TorchScript compilation issues and allow
-        # using of refinement to decouple initial_qmin and initial_qmax from quantization range.
-        # The actual values of initial_qmin and initial_qmax will be reset below.
+        # Default bounds only validate qrange_len when a custom bound is unspecified;
+        # they do not replace the quant_min/quant_max values returned below.
         if dtype in [torch.qint32, torch.int32]:
             initial_quant_min, initial_quant_max = 0, 2**32 - 1
         else:
             initial_quant_min, initial_quant_max = 0, 255
-        # The following assignment of self.qmin and self.qmax to the local variables and the if check refine the
-        # attribute from Optional valid integers for use, based on TorchScript's requirements.
         custom_quant_min, custom_quant_max = quant_min, quant_max
         if custom_quant_min is not None and custom_quant_max is not None:
             initial_quant_min, initial_quant_max = (
@@ -380,10 +377,7 @@ def validate_qmin_qmax(quant_min: int, quant_max: int) -> None:
     )
 
 
-# Functionally equivalent to '_calculate_qparams' in observer.py. Observers must be torchscriptable however and qscheme
-# as far as I can tell is not allowed to passed as a parameter in torchscript functions. This makes refactoring observer
-# to use this utility a massive pain and very gross. For now Im opting just to duplicate as this code seems unlikey to change
-# (last update over 1 year ago) and when torchscript is fully deprecated we can refactor. TODO(jakeszwe, jerryzh168)
+# TODO: Deduplicate with UniformQuantizationObserverBase._calculate_qparams.
 def determine_qparams(
     min_val: torch.Tensor,
     max_val: torch.Tensor,
@@ -446,11 +440,10 @@ def determine_qparams(
 
     # For scalar values, cast them to Tensors of size 1 to keep the shape
     # consistent with default values in FakeQuantize.
+    # TODO: Use scale.item() and zero_point.item() for scalar extraction.
     if len(scale.shape) == 0:
-        # TODO: switch to scale.item() after adding JIT support
         scale = torch.tensor([float(scale)], dtype=scale.dtype, device=device)
     if len(zero_point.shape) == 0:
-        # TODO: switch to zero_point.item() after adding JIT support
         zero_point = torch.tensor(
             [int(zero_point)], dtype=zero_point.dtype, device=device
         )
@@ -722,6 +715,7 @@ def fold_bn_weights_into_conv_node(
     bn_node: Node,
     m: GraphModule,
     fake_fuse: bool = False,  # removes the BN nodes but doesn't change the conv weights
+    replacement_node: Optional[Node] = None,
 ) -> None:
     # conv args: input, weight, bias, stride, padding, dilation, ...
     conv_w = _get_tensor_constant_from_node(conv_weight_node, m)
@@ -788,8 +782,11 @@ def fold_bn_weights_into_conv_node(
         conv_args[2] = get_bias_node
     conv_node.args = tuple(conv_args)
 
+    if replacement_node is None:
+        replacement_node = conv_node
+
     # native_batch_norm has 3 outputs, we expect getitem calls on the output
-    # and we want to replace the uses of getitem 0 with the output of conv
+    # and we want to replace the uses of getitem 0 with the fused output
     #
     if bn_node.target == torch.ops.aten.batch_norm.default:
         # With the new training ir, instead of batch_norm + getitem,
@@ -800,7 +797,7 @@ def fold_bn_weights_into_conv_node(
         # After:
         # conv -> users
         #       bn has no users now
-        bn_node.replace_all_uses_with(conv_node)
+        bn_node.replace_all_uses_with(replacement_node)
     else:
         # Before:
         # conv -> bn - (first output) -> users1
@@ -819,7 +816,7 @@ def fold_bn_weights_into_conv_node(
                 or user.args[1] != 0
             ):
                 continue
-            user.replace_all_uses_with(conv_node)
+            user.replace_all_uses_with(replacement_node)
 
     # If the BN node does not have users, erase it from the graph
     # Note: we need to do this manually because the model can still be in train
@@ -937,6 +934,63 @@ def fold_bn_weights_into_linear_node(
         m.graph.erase_node(bn_node)
 
 
+def _is_non_channel_slice_node(n: Node) -> bool:
+    if n.op != "call_function" or n.target not in (
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.slice_copy.Tensor,
+    ):
+        return False
+
+    dim = get_arg(n, "dim", int)
+    if dim >= 0:
+        return dim != 1
+
+    slice_input = n.args[0]
+    if not isinstance(slice_input, Node):
+        return False
+    input_val = slice_input.meta.get("val")
+    if not isinstance(input_val, torch.Tensor):
+        return False
+    return dim + input_val.dim() != 1
+
+
+def _is_contiguous_or_clone_node(n: Node) -> bool:
+    return n.op == "call_function" and n.target in (
+        torch.ops.aten.contiguous.default,
+        torch.ops.aten.clone.default,
+    )
+
+
+def _get_conv_bn_fusion_nodes(bn_node: Node) -> Optional[tuple[Node, Node]]:
+    bn_input = bn_node.args[0]
+    if not isinstance(bn_input, Node):
+        return None
+    if _is_conv_or_conv_transpose_node(bn_input):
+        return bn_input, bn_input
+
+    replacement_node = bn_input
+    slice_node = bn_input
+    if _is_contiguous_or_clone_node(slice_node):
+        if len(slice_node.users) != 1:
+            return None
+        slice_input = slice_node.args[0]
+        if not isinstance(slice_input, Node):
+            return None
+        slice_node = slice_input
+
+    if not _is_non_channel_slice_node(slice_node):
+        return None
+
+    conv_node = slice_node.args[0]
+    if not isinstance(conv_node, Node) or not _is_conv_or_conv_transpose_node(
+        conv_node
+    ):
+        return None
+    if len(conv_node.users) != 1 or len(slice_node.users) != 1:
+        return None
+    return conv_node, replacement_node
+
+
 # fuse conv bn weights, inplace modification of the graph_module and graph
 def _fuse_conv_bn_(m: GraphModule) -> None:
     has_bn = any(_is_bn_node(n) for n in m.graph.nodes)
@@ -952,10 +1006,10 @@ def _fuse_conv_bn_(m: GraphModule) -> None:
         ):
             continue
         bn_node = n
-        n = bn_node.args[0]
-        if not _is_conv_or_conv_transpose_node(n):
+        fusion_nodes = _get_conv_bn_fusion_nodes(bn_node)
+        if fusion_nodes is None:
             continue
-        conv_node = n
+        conv_node, replacement_node = fusion_nodes
         conv_weight_node = conv_node.args[1]
         conv_bias_node = conv_node.args[2] if len(conv_node.args) > 2 else None
         fold_bn_weights_into_conv_node(
@@ -965,6 +1019,7 @@ def _fuse_conv_bn_(m: GraphModule) -> None:
             bn_node,
             m,
             (conv_weight_node in fused_convs_weight_nodes),
+            replacement_node,
         )
         fused_convs_weight_nodes.add(conv_weight_node)
     m.graph.eliminate_dead_code()

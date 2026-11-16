@@ -75,7 +75,9 @@ from torchao.quantization.transform_module import (
 )
 from torchao.quantization.utils import (
     _fp8_mm_compat,
+    _linear_extra_repr,
     _module_extra_repr,
+    _quantization_type,
 )
 from torchao.utils import (
     is_MI300,
@@ -168,16 +170,33 @@ def _is_linear(mod, *args):
     from torchao.quantization.qat.affine_fake_quantized_tensor import (
         _AffineFakeQuantizedTensor,
     )
+    from torchao.utils import TorchAOBaseTensor
 
-    # adding weight tensor subclass isinstance check to make sure the weight is only quantized once
-    # when it is shared by multiple linear modules
-    # TODO: check isinstance(TorchAOBaseTensor)?
-    return (
+    if not (
         isinstance(mod, torch.nn.Linear)
         and hasattr(mod, "weight")
-        and not isinstance(mod.weight, _AffineFakeQuantizedTensor)
         and not isinstance(mod, nn.modules.linear.NonDynamicallyQuantizableLinear)
-    )
+    ):
+        return False
+
+    # Skip fake-quantized (QAT) weights. This is intended when a weight is shared
+    # by multiple linear modules, and is not an error, so skip silently.
+    if isinstance(mod.weight, _AffineFakeQuantizedTensor):
+        return False
+
+    if isinstance(mod.weight, TorchAOBaseTensor):
+        # Skip weights that are already a final quantized tensor so that a second
+        # quantize_() call is a no-op instead of re-running from_hp() on an
+        # already-quantized tensor, which hits unimplemented ops (see #4845).
+        fqn = args[0] if args and args[0] else "<root>"
+        logger.warning(
+            f"Skipping quantization of '{fqn}': weight is already quantized "
+            f"({type(mod.weight).__name__}); quantize_() does not re-quantize "
+            "already-quantized weights."
+        )
+        return False
+
+    return True
 
 
 def _get_subclass_inserter(cls, enable_parametrization=False, **kwargs):
@@ -244,6 +263,30 @@ def swap_conv2d_1x1_to_linear(model, filter_fn=None):
     _replace_with_custom_fn_if_matches_filter(
         model, replace_conv2d_1x1, filter_fn=filter_fn
     )
+
+
+def _embedding_extra_repr(self):
+    return f"num_embeddings={self.weight.shape[0]}, embedding_dim={self.weight.shape[1]}, weight={_quantization_type(self.weight)}"
+
+
+def _get_linear_subclass_inserter(
+    constructor, *, allow_requires_grad=False, propagate_bias=False, **kwargs
+):
+    """Helper function to apply the constructor that quantizes the weight Tensor (with additional kwargs)
+    to the weight of linear module
+    """
+
+    def insert_subclass(lin):
+        requires_grad = allow_requires_grad and lin.weight.requires_grad
+        if propagate_bias == True:
+            kwargs["bias"] = lin.bias
+        lin.weight = torch.nn.Parameter(
+            constructor(lin.weight, **kwargs), requires_grad=requires_grad
+        )
+        lin.extra_repr = types.MethodType(_linear_extra_repr, lin)
+        return lin
+
+    return insert_subclass
 
 
 def quantize_(
@@ -1534,7 +1577,7 @@ def _intx_weight_only_transform(
 
 @dataclass
 class FqnToConfig(AOBaseConfig):
-    """Configuration class for applying different quantization configs to modules or parameters based on their fully qualified names (FQNs).
+    r"""Configuration class for applying different quantization configs to modules or parameters based on their fully qualified names (FQNs).
 
     Args:
         `fqn_to_config`: typing.OrderedDict[str, Optional[AOBaseConfig]]: an

@@ -26,6 +26,11 @@ const float kTolKleidiAI = 5.0e-2;
 
 using namespace torchao::ops::linear_8bit_act_xbit_weight;
 
+// LUT encodings of the same quantized weights. kAffine (lut[i] = i - offset) and
+// kStretched (lut[i] = 2 * (i - offset), scales halved) are affine and take the
+// table-free decode path; kPermuted is not affine and needs the table lookup.
+enum class LutKind { kAffine, kStretched, kPermuted };
+
 template <int weight_nbit, bool has_weight_zeros, bool has_bias, bool has_clamp, bool has_lut = false>
 UKernelConfig get_ukernel_config() {
   namespace kernel = torchao::kernels::cpu::aarch64::linear::
@@ -53,14 +58,42 @@ UKernelConfig get_ukernel_config() {
       &torchao::weight_packing::pack_weights<weight_nbit, nr, kr, sr>,
       /*linear_configs*/ {});
 
-  uk.linear_configs[0] = UKernelConfig::linear_config_type{
-      m_step,
-      mr,
-      &kernel::packed_activations_size,
-      &kernel::packed_activations_offset,
-      &kernel::pack_activations<mr, kr, sr>,
-      &kernel::
-          kernel_1x8x16_f32_neondot<weight_nbit, has_weight_zeros, has_lut>};
+  if constexpr (weight_nbit < 8 && !has_weight_zeros) {
+    constexpr bool has_activation_qvals_sum = true;
+    uk.linear_configs[0] = UKernelConfig::linear_config_type{
+        m_step,
+        mr,
+        &kernel::packed_activations_with_qvals_sum_size,
+        &kernel::packed_activations_with_qvals_sum_offset,
+        &kernel::pack_activations_with_qvals_sum<mr, kr, sr>,
+        &kernel::kernel_1x8x16_f32_neondot<
+            weight_nbit,
+            has_weight_zeros,
+            has_lut,
+            has_activation_qvals_sum>};
+  } else {
+    uk.linear_configs[0] = UKernelConfig::linear_config_type{
+        m_step,
+        mr,
+        &kernel::packed_activations_size,
+        &kernel::packed_activations_offset,
+        &kernel::pack_activations<mr, kr, sr>,
+        &kernel::
+            kernel_1x8x16_f32_neondot<weight_nbit, has_weight_zeros, has_lut>};
+  }
+
+  {
+    constexpr int large_prefill_mr = 8;
+    constexpr int large_prefill_m_step = 8;
+    uk.linear_configs[1] = UKernelConfig::linear_config_type{
+        large_prefill_m_step,
+        large_prefill_mr,
+        &kernel::packed_activations_size,
+        &kernel::packed_activations_offset,
+        &kernel::pack_activations_interleaved<large_prefill_mr, kr, sr>,
+        &kernel::
+            kernel_8x8x16_f32_neondot<weight_nbit, has_weight_zeros, has_lut>};
+  }
 
   if constexpr (has_lut) {
     uk.packed_weights_size = &kernel::packed_weights_with_lut_size;
@@ -84,7 +117,8 @@ void test_linear_8bit_act_xbit_weight(
     int n,
     int k,
     int group_size,
-    const UKernelConfig* ukernel_config_arg = nullptr) {
+    const UKernelConfig* ukernel_config_arg = nullptr,
+    LutKind lut_kind = LutKind::kAffine) {
   UKernelConfig ukernel_config;
   if (ukernel_config_arg != nullptr) {
     ukernel_config = *ukernel_config_arg;
@@ -147,11 +181,20 @@ void test_linear_8bit_act_xbit_weight(
       std::vector<int8_t> weight_qval_idxs(test_case.weight_qvals.size());
       std::vector<int8_t> lut(lut_size, 0);
       constexpr int offset = (1 << (weight_nbit - 1));
-      for (int i = 0; i < test_case.weight_qvals.size(); i++) {
-        weight_qval_idxs[i] = test_case.weight_qvals[i] + offset;
+      const int lut_multiplier = lut_kind == LutKind::kStretched ? 2 : 1;
+      std::vector<int> lut_idx_of_qval(lut_size);
+      for (int q = 0; q < lut_size; q++) {
+        lut_idx_of_qval[q] =
+            lut_kind == LutKind::kPermuted ? (3 * q + 1) % lut_size : q;
+        lut[lut_idx_of_qval[q]] = lut_multiplier * (q - offset);
       }
-      for (int i = 0; i < lut_size; i++) {
-        lut[i] = i - offset;
+      for (int i = 0; i < test_case.weight_qvals.size(); i++) {
+        weight_qval_idxs[i] =
+            lut_idx_of_qval[test_case.weight_qvals[i] + offset];
+      }
+      std::vector<float> lut_weight_scales(test_case.weight_scales);
+      for (auto& scale : lut_weight_scales) {
+        scale /= lut_multiplier;
       }
       pack_weights_with_lut_operator(
           ukernel_config,
@@ -162,7 +205,7 @@ void test_linear_8bit_act_xbit_weight(
           weight_qval_idxs.data(),
           /*n_luts*/ 1,
           lut.data(),
-          test_case.weight_scales.data(),
+          lut_weight_scales.data(),
           weight_zeros_ptr,
           bias_ptr);
     } else {
@@ -416,6 +459,64 @@ TEST(test_linear_8bit_act_xbit_weight_lut, HasClamp) {
       /*m=*/13, /*n=*/8 * 10 + 3, /*k=*/16 * 3, /*group_size=*/16);
 }
 
+template <int weight_nbit, bool has_weight_zeros, bool has_bias, bool has_clamp>
+void test_lut_prefill(int m) {
+  test_linear_8bit_act_xbit_weight<
+      weight_nbit,
+      has_weight_zeros,
+      has_bias,
+      has_clamp,
+      /*has_kleidi=*/false,
+      /*has_lut=*/true>(m, /*n=*/8 * 10 + 3, /*k=*/16 * 4, /*group_size=*/32);
+}
+
+TEST(test_linear_8bit_act_xbit_weight_lut, PrefillAllLowBitWidths) {
+  // Covers the 16-row tiles, the 9..15, 5..8 and 2..4 row tails, the single
+  // final row, and parallel activation packing (m >= 64).
+  for (int m : {2, 5, 8, 13, 16, 17, 31, 65}) {
+    test_lut_prefill<1, false, false, false>(m);
+    test_lut_prefill<2, false, false, false>(m);
+    test_lut_prefill<3, false, false, false>(m);
+    test_lut_prefill<4, false, false, false>(m);
+  }
+}
+
+template <int weight_nbit, bool has_weight_zeros>
+void test_lut_kinds(int m) {
+  for (auto lut_kind :
+       {LutKind::kAffine, LutKind::kStretched, LutKind::kPermuted}) {
+    // Halving scales only preserves the weights when there are no zeros.
+    if (has_weight_zeros && lut_kind == LutKind::kStretched) {
+      continue;
+    }
+    test_linear_8bit_act_xbit_weight<
+        weight_nbit,
+        has_weight_zeros,
+        /*has_bias*/ true,
+        /*has_clamp*/ false,
+        /*has_kleidi*/ false,
+        /*has_lut*/ true>(
+        m, /*n=*/8 * 10 + 3, /*k=*/16 * 4, /*group_size=*/32, nullptr, lut_kind);
+  }
+}
+
+TEST(test_linear_8bit_act_xbit_weight_lut, AffineAndNonAffineLuts) {
+  for (int m : {1, 3, 13}) {
+    test_lut_kinds<1, false>(m);
+    test_lut_kinds<2, false>(m);
+    test_lut_kinds<3, false>(m);
+    test_lut_kinds<4, false>(m);
+    test_lut_kinds<2, true>(m);
+  }
+}
+
+TEST(test_linear_8bit_act_xbit_weight_lut, PrefillAllOptions) {
+  for (int m : {13, 16, 31}) {
+    test_lut_prefill<2, true, true, true>(m);
+    test_lut_prefill<2, false, true, true>(m);
+  }
+}
+
 TEST(test_linear_8bit_act_xbit_weight, Standard) {
   test_linear_8bit_act_xbit_weight<
       4 /*weight_nbit*/,
@@ -423,6 +524,154 @@ TEST(test_linear_8bit_act_xbit_weight, Standard) {
       false /*has_bias*/,
       false /*has_clamp*/>(
       /*m=*/13, /*n=*/8 * 10 + 3, /*k=*/16 * 3, /*group_size=*/16);
+}
+
+template <int weight_nbit>
+void test_decode_for_bit_width() {
+  test_linear_8bit_act_xbit_weight<
+      weight_nbit,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/1, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+  test_linear_8bit_act_xbit_weight<
+      weight_nbit,
+      false /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/3, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, DecodeAllLowBitWidths) {
+  test_decode_for_bit_width<1>();
+  test_decode_for_bit_width<2>();
+  test_decode_for_bit_width<3>();
+  test_decode_for_bit_width<4>();
+  test_decode_for_bit_width<5>();
+  test_decode_for_bit_width<6>();
+  test_decode_for_bit_width<7>();
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitPrefill) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      false /*has_weight_zeros*/,
+      false /*has_bias*/,
+      false /*has_clamp*/>(
+      /*m=*/13, /*n=*/8 * 10 + 3, /*k=*/16 * 3, /*group_size=*/16);
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      false /*has_weight_zeros*/,
+      false /*has_bias*/,
+      false /*has_clamp*/>(
+      /*m=*/16, /*n=*/8 * 4, /*k=*/16 * 8, /*group_size=*/64);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitSmallPrefill) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      false /*has_weight_zeros*/,
+      false /*has_bias*/,
+      false /*has_clamp*/>(
+      /*m=*/3, /*n=*/8 * 2 + 1, /*k=*/16 * 4, /*group_size=*/32);
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      false /*has_weight_zeros*/,
+      false /*has_bias*/,
+      false /*has_clamp*/>(
+      /*m=*/7, /*n=*/8 * 2 + 1, /*k=*/16 * 4, /*group_size=*/32);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitPaddedMTails) {
+  for (int m = 8; m < 16; m++) {
+    test_linear_8bit_act_xbit_weight<
+        3 /*weight_nbit*/,
+        true /*has_weight_zeros*/,
+        true /*has_bias*/,
+        true /*has_clamp*/>(
+        m, /*n=*/8 * 2 + 3, /*k=*/16 * 4, /*group_size=*/32);
+  }
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitPrefillWeightZeros) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      false /*has_bias*/,
+      false /*has_clamp*/>(
+      /*m=*/13, /*n=*/8 * 10 + 3, /*k=*/16 * 4, /*group_size=*/32);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitPrefillBiasClamp) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      false /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/13, /*n=*/8 * 10 + 3, /*k=*/16 * 3, /*group_size=*/16);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitPrefillAllOptions) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/15, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/17, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/31, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, ThreeBitParallelActivationPacking) {
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/65, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+  test_linear_8bit_act_xbit_weight<
+      3 /*weight_nbit*/,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/1025, /*n=*/8 * 3 + 5, /*k=*/16 * 8, /*group_size=*/64);
+}
+
+template <int weight_nbit>
+void test_prefill_for_bit_width() {
+  test_linear_8bit_act_xbit_weight<
+      weight_nbit,
+      false /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/17, /*n=*/8 + 5, /*k=*/16 * 4, /*group_size=*/32);
+  test_linear_8bit_act_xbit_weight<
+      weight_nbit,
+      true /*has_weight_zeros*/,
+      true /*has_bias*/,
+      true /*has_clamp*/>(
+      /*m=*/17, /*n=*/8 + 5, /*k=*/16 * 4, /*group_size=*/32);
+}
+
+TEST(test_linear_8bit_act_xbit_weight, PrefillAllBitWidths) {
+  test_prefill_for_bit_width<1>();
+  test_prefill_for_bit_width<2>();
+  test_prefill_for_bit_width<3>();
+  test_prefill_for_bit_width<4>();
+  test_prefill_for_bit_width<5>();
+  test_prefill_for_bit_width<6>();
+  test_prefill_for_bit_width<7>();
+  test_prefill_for_bit_width<8>();
 }
 
 TEST(test_linear_8bit_act_xbit_weight, HasWeightZeros) {
